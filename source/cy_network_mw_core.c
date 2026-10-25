@@ -602,6 +602,31 @@ static struct pbuf *pbuf_dup(const struct pbuf *orig)
         speedtest_lwip_timestamp_t pbuf_copy_start = speedtest_lwip_diag_now();
         speedtest_lwip_diag_wifi_pbuf_copy_begin();
         int fast_copy = 0;
+        uint32_t fast_copy_reject_reason = 0u;
+#endif
+#if defined(SPEEDTEST_WIFI_DUP_CHAIN_FAST_COPY) && SPEEDTEST_WIFI_DUP_CHAIN_FAST_COPY
+        if (orig->next != NULL && p->next == NULL &&
+            orig->tot_len <= p->len)
+        {
+#if SPEEDTEST_CM0_ONLY
+            fast_copy = 1;
+            speedtest_lwip_timestamp_t memcpy_start =
+                speedtest_lwip_diag_now();
+#endif
+            uint8_t *destination = (uint8_t *)p->payload;
+            const struct pbuf *source = orig;
+            while (source != NULL)
+            {
+                MEMCPY(destination, source->payload, source->len);
+                destination += source->len;
+                source = source->next;
+            }
+#if SPEEDTEST_CM0_ONLY
+            speedtest_lwip_diag_record_wifi_pbuf_memcpy(
+                memcpy_start, (uint32_t)orig->tot_len);
+#endif
+        }
+        else
 #endif
 #if defined(SPEEDTEST_WIFI_DUP_FAST_COPY) && SPEEDTEST_WIFI_DUP_FAST_COPY
         if (orig->next == NULL && p->next == NULL &&
@@ -610,8 +635,6 @@ static struct pbuf *pbuf_dup(const struct pbuf *orig)
         {
 #if SPEEDTEST_CM0_ONLY
             fast_copy = 1;
-#endif
-#if SPEEDTEST_CM0_ONLY
             speedtest_lwip_timestamp_t memcpy_start =
                 speedtest_lwip_diag_now();
 #endif
@@ -623,17 +646,29 @@ static struct pbuf *pbuf_dup(const struct pbuf *orig)
         }
         else
 #endif
-        pbuf_copy(p, orig);
+        {
+#if SPEEDTEST_CM0_ONLY
+            if (orig->next != NULL)
+                fast_copy_reject_reason = 1u;
+            else if (p->next != NULL)
+                fast_copy_reject_reason = 2u;
+            else
+                fast_copy_reject_reason = 3u;
+#endif
+            pbuf_copy(p, orig);
+        }
 #if SPEEDTEST_CM0_ONLY
         speedtest_lwip_diag_record_wifi_pbuf_copy_path(
             source_segments, (uint32_t)orig->tot_len,
-            destination_segments, fast_copy);
+            destination_segments, fast_copy, fast_copy_reject_reason);
         speedtest_lwip_diag_wifi_pbuf_copy_end();
         speedtest_lwip_diag_record_wifi_pbuf_copy(pbuf_copy_start);
 #endif
-        /* Preserve PBUF_FLAG_IS_CUSTOM so WHD's asynchronous pbuf_free()
-         * returns a static-pool slot instead of freeing it as heap memory. */
-        p->flags = (uint8_t)(p->flags | orig->flags);
+        /* Keep the destination's allocation flags as initialized by
+         * pbuf_alloc()/pbuf_alloced_custom().  In particular, do not copy
+         * PBUF_FLAG_IS_CUSTOM from a caller-owned source pbuf onto an
+         * ordinary heap destination: pbuf_free() would then interpret the
+         * heap object as struct pbuf_custom and call an invalid callback. */
     }
     return p;
 }
@@ -664,9 +699,26 @@ static err_t wifioutput(struct netif *iface, struct pbuf *p)
 #if SPEEDTEST_CM0_ONLY
     speedtest_lwip_timestamp_t pbuf_dup_start = speedtest_lwip_diag_now();
 #endif
-    struct pbuf *whd_buf = pbuf_dup(p);
+    struct pbuf *whd_buf = NULL;
+    int direct_tx_pbuf = 0;
+#if SPEEDTEST_CM0_ONLY && SPEEDTEST_CM0_RAW_UDP_DIRECT_PBUF
+    if (speedtest_lwip_diag_is_direct_tx_pbuf(p))
+    {
+        /* The caller keeps its reference until udp_sendto() returns.  WHD
+         * queues asynchronously, so retain a second reference for WHD and
+         * let cy_buffer_release() drop it after transmission. */
+        whd_buf = p;
+        pbuf_ref(whd_buf);
+        direct_tx_pbuf = 1;
+    }
+    else
+#endif
+    {
+        whd_buf = pbuf_dup(p);
+    }
 #if SPEEDTEST_CM0_ONLY
-    speedtest_lwip_diag_record_wifi_pbuf_dup(pbuf_dup_start, whd_buf != NULL);
+    if (!direct_tx_pbuf)
+        speedtest_lwip_diag_record_wifi_pbuf_dup(pbuf_dup_start, whd_buf != NULL);
 #endif
     if (whd_buf == NULL)
     {
@@ -688,6 +740,13 @@ static err_t wifioutput(struct netif *iface, struct pbuf *p)
     whd_result_t whd_send_result = whd_network_send_ethernet_data(
         (whd_interface_t)if_ctx->hw_interface, whd_buf);
     speedtest_lwip_diag_record_whd_send(whd_send_start, (int)whd_send_result);
+    if (direct_tx_pbuf && whd_send_result != WHD_SUCCESS)
+    {
+        /* WHD does not take ownership on a synchronous failure.  Drop the
+         * extra WHD reference; the caller still owns its original reference. */
+        pbuf_free(whd_buf);
+        return ERR_IF;
+    }
 #else
     whd_network_send_ethernet_data((whd_interface_t)if_ctx->hw_interface, whd_buf) ;
 #endif
