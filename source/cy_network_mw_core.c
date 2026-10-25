@@ -55,12 +55,19 @@
 #include "lwip/timeouts.h"
 #endif
 #include "lwip/autoip.h"
+#include "lwip/pbuf.h"
 
 #include "cy_lwip_dhcp_server.h"
 #include "cy_network_mw_core.h"
 #include "cy_result.h"
 #include "cy_lwip_log.h"
 #include "cy_lwip_internal.h"
+#include "speedtest_lwip_diag.h"
+
+#if defined(SPEEDTEST_WIFI_DUP_USE_STATIC_POOL) && SPEEDTEST_WIFI_DUP_USE_STATIC_POOL
+#include "FreeRTOS.h"
+#include "task.h"
+#endif
 
 #if defined(CYBSP_WIFI_CAPABLE)
 #include "cybsp_wifi.h"
@@ -357,6 +364,107 @@ static void cy_sys_wait_for_input(uint32_t wait_time_ms)
 
 #endif
 
+#if defined(SPEEDTEST_WIFI_DUP_USE_STATIC_POOL) && SPEEDTEST_WIFI_DUP_USE_STATIC_POOL
+#define SPEEDTEST_WIFI_TX_POOL_SLOTS 8u
+#define SPEEDTEST_WIFI_TX_POOL_MAX_BYTES WHD_LINK_MTU
+#define SPEEDTEST_WIFI_TX_POOL_STORAGE_BYTES \
+    LWIP_MEM_ALIGN_BUFFER(LWIP_MEM_ALIGN_SIZE(PBUF_LINK) + \
+                          SPEEDTEST_WIFI_TX_POOL_MAX_BYTES)
+
+typedef struct __attribute__((aligned(MEM_ALIGNMENT)))
+{
+    struct pbuf_custom custom;
+    uint8_t payload[SPEEDTEST_WIFI_TX_POOL_STORAGE_BYTES];
+} speedtest_wifi_tx_pool_slot_t;
+
+static speedtest_wifi_tx_pool_slot_t speedtest_wifi_tx_pool[
+    SPEEDTEST_WIFI_TX_POOL_SLOTS];
+static volatile uint32_t speedtest_wifi_tx_pool_free_mask =
+    (1u << SPEEDTEST_WIFI_TX_POOL_SLOTS) - 1u;
+static volatile uint32_t speedtest_wifi_tx_pool_alloc_success_count;
+static volatile uint32_t speedtest_wifi_tx_pool_no_free_slot_failures;
+static volatile uint32_t speedtest_wifi_tx_pool_in_use;
+static volatile uint32_t speedtest_wifi_tx_pool_in_use_max;
+
+static void speedtest_wifi_tx_pool_free(struct pbuf *p)
+{
+    speedtest_wifi_tx_pool_slot_t *slot =
+        (speedtest_wifi_tx_pool_slot_t *)p;
+    uintptr_t slot_index = (uintptr_t)(slot - speedtest_wifi_tx_pool);
+    if (slot_index < SPEEDTEST_WIFI_TX_POOL_SLOTS)
+    {
+        taskENTER_CRITICAL();
+        uint32_t slot_bit = 1u << slot_index;
+        if ((speedtest_wifi_tx_pool_free_mask & slot_bit) == 0u)
+        {
+            speedtest_wifi_tx_pool_free_mask |= slot_bit;
+            if (speedtest_wifi_tx_pool_in_use != 0u)
+                --speedtest_wifi_tx_pool_in_use;
+        }
+        taskEXIT_CRITICAL();
+    }
+}
+
+static struct pbuf *speedtest_wifi_tx_pool_alloc(u16_t length)
+{
+    if (length > SPEEDTEST_WIFI_TX_POOL_MAX_BYTES)
+        return NULL;
+
+    uint32_t selected_bit = 0u;
+    taskENTER_CRITICAL();
+    uint32_t free_mask = speedtest_wifi_tx_pool_free_mask;
+    if (free_mask != 0u)
+    {
+        selected_bit = free_mask & (~free_mask + 1u);
+        speedtest_wifi_tx_pool_free_mask &= ~selected_bit;
+        ++speedtest_wifi_tx_pool_in_use;
+        if (speedtest_wifi_tx_pool_in_use > speedtest_wifi_tx_pool_in_use_max)
+            speedtest_wifi_tx_pool_in_use_max = speedtest_wifi_tx_pool_in_use;
+    }
+    taskEXIT_CRITICAL();
+    if (selected_bit == 0u)
+    {
+        taskENTER_CRITICAL();
+        ++speedtest_wifi_tx_pool_no_free_slot_failures;
+        taskEXIT_CRITICAL();
+        return NULL;
+    }
+
+    unsigned slot_index = 0u;
+    uint32_t bit = selected_bit;
+    while ((bit >>= 1u) != 0u)
+        ++slot_index;
+    speedtest_wifi_tx_pool_slot_t *slot =
+        &speedtest_wifi_tx_pool[slot_index];
+    slot->custom.custom_free_function = speedtest_wifi_tx_pool_free;
+    struct pbuf *p = pbuf_alloced_custom(
+        PBUF_LINK, length, PBUF_RAM, &slot->custom, slot->payload,
+        sizeof(slot->payload));
+    if (p == NULL)
+    {
+        speedtest_wifi_tx_pool_free(&slot->custom.pbuf);
+        return NULL;
+    }
+    taskENTER_CRITICAL();
+    ++speedtest_wifi_tx_pool_alloc_success_count;
+    taskEXIT_CRITICAL();
+    return p;
+}
+
+void speedtest_lwip_diag_get_wifi_tx_pool_stats(
+    speedtest_lwip_tx_pool_stats_t *stats)
+{
+    if (stats == NULL)
+        return;
+    taskENTER_CRITICAL();
+    stats->alloc_success_count = speedtest_wifi_tx_pool_alloc_success_count;
+    stats->no_free_slot_failures = speedtest_wifi_tx_pool_no_free_slot_failures;
+    stats->in_use = speedtest_wifi_tx_pool_in_use;
+    stats->in_use_max = speedtest_wifi_tx_pool_in_use_max;
+    taskEXIT_CRITICAL();
+}
+#endif
+
 #if defined(CYBSP_WIFI_CAPABLE)
 /*
  * This function takes packets from the radio driver and passes them into the
@@ -438,11 +546,94 @@ void cy_network_process_ethernet_data(whd_interface_t iface, whd_buffer_t buf)
 /* Create a duplicate pbuf of the input pbuf */
 static struct pbuf *pbuf_dup(const struct pbuf *orig)
 {
-    struct pbuf *p = pbuf_alloc(PBUF_LINK, orig->tot_len, PBUF_RAM);
+#if SPEEDTEST_CM0_ONLY
+    speedtest_lwip_timestamp_t pbuf_alloc_start = speedtest_lwip_diag_now();
+#endif
+#if defined(SPEEDTEST_WIFI_DUP_USE_STATIC_POOL) && SPEEDTEST_WIFI_DUP_USE_STATIC_POOL
+    struct pbuf *p = NULL;
+    /* Use the custom pool only for the fixed-size telemetry frame.  Other
+     * packets must retain the normal heap-backed allocation path, and a full
+     * pool must not make control/network startup traffic fail. */
+    if (orig->tot_len == SPEEDTEST_WIFI_TX_POOL_MAX_BYTES)
+        p = speedtest_wifi_tx_pool_alloc(orig->tot_len);
+    if (p == NULL)
+    {
+        const pbuf_layer layer = PBUF_LINK;
+        p = pbuf_alloc(layer, orig->tot_len, PBUF_RAM);
+    }
+#else
+#if defined(SPEEDTEST_WIFI_DUP_USE_POOL) && SPEEDTEST_WIFI_DUP_USE_POOL
+    const pbuf_layer layer = PBUF_LINK;
+#else
+    const pbuf_layer layer = PBUF_LINK;
+#endif
+    const pbuf_type type =
+#if defined(SPEEDTEST_WIFI_DUP_USE_POOL) && SPEEDTEST_WIFI_DUP_USE_POOL
+        PBUF_POOL;
+#else
+        PBUF_RAM;
+#endif
+    struct pbuf *p = pbuf_alloc(layer, orig->tot_len, type);
+#endif
+#if SPEEDTEST_CM0_ONLY
+    speedtest_lwip_diag_record_wifi_pbuf_alloc(pbuf_alloc_start, p != NULL);
+    if (p == NULL)
+        speedtest_lwip_diag_record_wifi_pbuf_alloc_failure(orig->tot_len);
+#endif
     if (p != NULL)
     {
+#if SPEEDTEST_CM0_ONLY
+        uint32_t source_segments = 0u;
+        uint32_t destination_segments = 0u;
+        const struct pbuf *source_probe = orig;
+        const struct pbuf *destination_probe = p;
+        while (source_probe != NULL)
+        {
+            ++source_segments;
+            source_probe = source_probe->next;
+        }
+        while (destination_probe != NULL)
+        {
+            ++destination_segments;
+            destination_probe = destination_probe->next;
+        }
+#endif
+#if SPEEDTEST_CM0_ONLY
+        speedtest_lwip_timestamp_t pbuf_copy_start = speedtest_lwip_diag_now();
+        speedtest_lwip_diag_wifi_pbuf_copy_begin();
+        int fast_copy = 0;
+#endif
+#if defined(SPEEDTEST_WIFI_DUP_FAST_COPY) && SPEEDTEST_WIFI_DUP_FAST_COPY
+        if (orig->next == NULL && p->next == NULL &&
+            orig->len <= p->len && orig->len == orig->tot_len &&
+            p->len == p->tot_len)
+        {
+#if SPEEDTEST_CM0_ONLY
+            fast_copy = 1;
+#endif
+#if SPEEDTEST_CM0_ONLY
+            speedtest_lwip_timestamp_t memcpy_start =
+                speedtest_lwip_diag_now();
+#endif
+            MEMCPY(p->payload, orig->payload, orig->len);
+#if SPEEDTEST_CM0_ONLY
+            speedtest_lwip_diag_record_wifi_pbuf_memcpy(
+                memcpy_start, (uint32_t)orig->len);
+#endif
+        }
+        else
+#endif
         pbuf_copy(p, orig);
-        p->flags = orig->flags;
+#if SPEEDTEST_CM0_ONLY
+        speedtest_lwip_diag_record_wifi_pbuf_copy_path(
+            source_segments, (uint32_t)orig->tot_len,
+            destination_segments, fast_copy);
+        speedtest_lwip_diag_wifi_pbuf_copy_end();
+        speedtest_lwip_diag_record_wifi_pbuf_copy(pbuf_copy_start);
+#endif
+        /* Preserve PBUF_FLAG_IS_CUSTOM so WHD's asynchronous pbuf_free()
+         * returns a static-pool slot instead of freeing it as heap memory. */
+        p->flags = (uint8_t)(p->flags | orig->flags);
     }
     return p;
 }
@@ -463,16 +654,28 @@ static err_t wifioutput(struct netif *iface, struct pbuf *p)
 
     if (whd_wifi_is_ready_to_transceive((whd_interface_t)if_ctx->hw_interface) != WHD_SUCCESS)
     {
+#if SPEEDTEST_CM0_ONLY
+        speedtest_lwip_diag_record_wifi_not_ready();
+#endif
         cm_cy_log_msg(CYLF_MIDDLEWARE, CY_LOG_ERR, "Wi-Fi is not ready, packet not sent\n");
         return ERR_INPROGRESS ;
     }
 
+#if SPEEDTEST_CM0_ONLY
+    speedtest_lwip_timestamp_t pbuf_dup_start = speedtest_lwip_diag_now();
+#endif
     struct pbuf *whd_buf = pbuf_dup(p);
+#if SPEEDTEST_CM0_ONLY
+    speedtest_lwip_diag_record_wifi_pbuf_dup(pbuf_dup_start, whd_buf != NULL);
+#endif
     if (whd_buf == NULL)
     {
         cm_cy_log_msg(CYLF_MIDDLEWARE, CY_LOG_ERR, "failed to allocate buffer for outgoing packet\n");
         return ERR_MEM;
     }
+#if SPEEDTEST_CM0_ONLY
+    speedtest_lwip_diag_record_wifi_tx_pbuf_alloc(whd_buf);
+#endif
     /* Call the registered activity handler with the argument as true
      * indicating there is TX packet
      */
@@ -480,7 +683,14 @@ static err_t wifioutput(struct netif *iface, struct pbuf *p)
     {
         activity_callback(true);
     }
+#if SPEEDTEST_CM0_ONLY
+    speedtest_lwip_timestamp_t whd_send_start = speedtest_lwip_diag_now();
+    whd_result_t whd_send_result = whd_network_send_ethernet_data(
+        (whd_interface_t)if_ctx->hw_interface, whd_buf);
+    speedtest_lwip_diag_record_whd_send(whd_send_start, (int)whd_send_result);
+#else
     whd_network_send_ethernet_data((whd_interface_t)if_ctx->hw_interface, whd_buf) ;
+#endif
 
     cm_cy_log_msg( CYLF_MIDDLEWARE, CY_LOG_DEBUG, "%s(): END \n", __FUNCTION__ );
 
