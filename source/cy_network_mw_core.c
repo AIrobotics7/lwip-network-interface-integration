@@ -701,7 +701,8 @@ static err_t wifioutput(struct netif *iface, struct pbuf *p)
 #endif
     struct pbuf *whd_buf = NULL;
     int direct_tx_pbuf = 0;
-#if SPEEDTEST_CM0_ONLY && SPEEDTEST_CM0_RAW_UDP_DIRECT_PBUF
+#if defined(SPEEDTEST_CM0_RAW_UDP_DIRECT_PBUF) && \
+    SPEEDTEST_CM0_RAW_UDP_DIRECT_PBUF
     if (speedtest_lwip_diag_is_direct_tx_pbuf(p))
     {
         /* The caller keeps its reference until udp_sendto() returns.  WHD
