@@ -738,19 +738,20 @@ static err_t wifioutput(struct netif *iface, struct pbuf *p)
     }
 #if SPEEDTEST_CM0_ONLY
     speedtest_lwip_timestamp_t whd_send_start = speedtest_lwip_diag_now();
+#endif
     whd_result_t whd_send_result = whd_network_send_ethernet_data(
         (whd_interface_t)if_ctx->hw_interface, whd_buf);
+#if SPEEDTEST_CM0_ONLY
     speedtest_lwip_diag_record_whd_send(whd_send_start, (int)whd_send_result);
+#endif
     if (direct_tx_pbuf && whd_send_result != WHD_SUCCESS)
     {
-        /* WHD does not take ownership on a synchronous failure.  Drop the
-         * extra WHD reference; the caller still owns its original reference. */
-        pbuf_free(whd_buf);
+        /* The SDPCM/CDC transmit path used by this board releases the WHD
+         * buffer on its synchronous header/queue failure paths.  Do not
+         * release that reference twice; the caller still owns and will
+         * release its original lwIP reference. */
         return ERR_IF;
     }
-#else
-    whd_network_send_ethernet_data((whd_interface_t)if_ctx->hw_interface, whd_buf) ;
-#endif
 
     cm_cy_log_msg( CYLF_MIDDLEWARE, CY_LOG_DEBUG, "%s(): END \n", __FUNCTION__ );
 
